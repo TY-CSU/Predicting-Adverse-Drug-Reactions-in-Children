@@ -25,8 +25,8 @@ os.environ['TABPFN_MODEL_PATH'] = "/public/home/tianyao/.conda/envs/tabpfn/lib/p
 
 # - FEATURES_PATH：包含标签列（多个 ADR 端点）与 'Smiles'
 # - DATA_PATH：包含 'Smiles' 与 'BioFeat'（需解析成数值向量）
-FEATURES_PATH = '/public/home/tianyao/biosignature/features.csv'              # 标签 + Smiles
-DATA_PATH     = '/public/home/tianyao/xgboost/433_labeled_results_with_smiles.csv'  # Smiles + BioFeat
+FEATURES_PATH = '/public/home/tianyao/biosignature/features.csv'     
+DATA_PATH     = '/public/home/tianyao/xgboost/433_labeled_results_with_smiles.csv'  
 
 # 从第几个任务开始（1-based），用于断点续跑
 START_TASK_ID = 1
