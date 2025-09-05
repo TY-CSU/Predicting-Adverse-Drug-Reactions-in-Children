@@ -17,13 +17,12 @@ from sklearn.feature_selection import SelectKBest, mutual_info_classif
 from tabpfn_extensions.post_hoc_ensembles.sklearn_interface import AutoTabPFNClassifier
 
 # =========================
-# 可配置参数（根据需要修改）
+# 可配置参数
 # =========================
 
 # 指定 TabPFN 模型权重路径（按本地环境调整）
 os.environ['TABPFN_MODEL_PATH'] = "/public/home/tianyao/.conda/envs/tabpfn/lib/python3.11/site-packages/tabpfn/models/tabpfn-v2-classifier-od3j1g5m.ckpt"
 
-# 路径约定（已纠正语义）：
 # - FEATURES_PATH：包含标签列（多个 ADR 端点）与 'Smiles'
 # - DATA_PATH：包含 'Smiles' 与 'BioFeat'（需解析成数值向量）
 FEATURES_PATH = '/public/home/tianyao/biosignature/features.csv'              # 标签 + Smiles
