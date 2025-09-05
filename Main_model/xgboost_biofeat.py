@@ -1,259 +1,303 @@
-import os  
-import joblib  
-import pandas as pd  
-import numpy as np  
-import cupy as cp  
-import json  
-from sklearn.model_selection import StratifiedKFold  
-from sklearn.metrics import (  
-    roc_auc_score,  
-    average_precision_score,  
-    accuracy_score,  
-    f1_score,  
-    matthews_corrcoef,  
-    roc_curve  
-)  
-import xgboost as xgb  
-import optuna  
-import matplotlib.pyplot as plt  
-from sklearn.model_selection import train_test_split  
-from scipy.interpolate import interp1d  
+import os
+import sys
+import json
+import joblib
+import numpy as np
+import pandas as pd
+from datetime import datetime
 
- 
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, accuracy_score,
+    f1_score, matthews_corrcoef, balanced_accuracy_score,
+    recall_score
+)
+from sklearn.model_selection import StratifiedKFold, train_test_split
 
-# 定义数据集路径  
-data_path = '/public/home/tianyao/biosignature/features.csv'  
-features_path = '/public/home/tianyao/xgboost/433_labeled_results_with_smiles.csv'  
+import xgboost as xgb
 
-def parse_biofeat(biofeat_str):  
-    """解析 BioFeat 字符串为 NumPy 数组。支持 JSON 格式的字符串"""  
-    try:  
-        return np.array(json.loads(biofeat_str))  
-    except (ValueError, json.JSONDecodeError):  
-        print(f"无法解析的特征: {biofeat_str}")  
-        return None  
+# =========================
+# 可配置参数
+# =========================
 
-def auc_eval(preds, dtrain):  
-    labels = dtrain.get_label()  
-    preds = 1.0 / (1.0 + np.exp(-preds))  
-    auc = roc_auc_score(labels, preds)  
-    return 'auc', auc  
+FEATURES_PATH = '/public/home/tianyao/biosignature/features.csv'
+DATA_PATH     = '/public/home/tianyao/xgboost/433_labeled_results_with_smiles.csv'
 
-def objective(trial, X, y):  
-    param = {  
-        'tree_method': 'hist',  
-        'device': 'gpu',  
-        'objective': 'binary:logistic',  
-        'predictor': 'gpu_predictor',  
-        'eval_metric': 'auc',  
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.3, log=True),  
-        'max_depth': trial.suggest_int('max_depth', 3, 8),  
-        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),  
-        'subsample': trial.suggest_float('subsample', 0.6, 1.0),  
-        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),  
-        'n_estimators': trial.suggest_int('n_estimators', 100, 500),  
-        'scale_pos_weight': trial.suggest_float('scale_pos_weight', 1, 10)  
-    }  
+# 从第几个任务开始（1-based），用于断点续跑
+START_TASK_ID = 1
 
-    skf = StratifiedKFold(n_splits=10, shuffle=True, random_state=42)  
-    scores = []  
+# 分层 K 折交叉验证设置
+N_SPLITS = 10
+SHUFFLE = True
+RANDOM_STATE = 42
 
-    for train_index, val_index in skf.split(cp.asnumpy(X), cp.asnumpy(y)):  
-        X_train_kf, X_val_kf = X[train_index], X[val_index]  
-        y_train_kf, y_val_kf = y[train_index], y[val_index]  
+# XGBoost 基础超参（不使用特征选择，也不做 Optuna）
+XGB_PARAMS = dict(
+    tree_method='hist',        
+    objective='binary:logistic',
+    eval_metric='auc',
+    learning_rate=0.05,
+    max_depth=6,
+    min_child_weight=1,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    n_estimators=500,
+    reg_alpha=0.0,
+    reg_lambda=1.0
+)
+USE_GPU = False  
 
-        if len(cp.unique(y_val_kf)) < 2:  
-            continue  
+# 输出目录
+OUTPUT_ROOT = 'xgb_cv_biofeat'
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
 
-        X_train_kf_np = cp.asnumpy(X_train_kf)  
-        y_train_kf_np = cp.asnumpy(y_train_kf)  
-        X_val_kf_np = cp.asnumpy(X_val_kf)  
-        y_val_kf_np = cp.asnumpy(y_val_kf)  
+USE_EXTERNAL_HOLDOUT = True
+EXTERNAL_TEST_SIZE = 0.1
 
-        model = xgb.XGBClassifier(  
-            **param,  
-            use_label_encoder=False,  
-            early_stopping_rounds=10,  
-            verbosity=0  
-        )  
+# ==============
+# 工具函数
+# ==============
 
-        model.fit(  
-            X_train_kf_np, y_train_kf_np,  
-            eval_set=[(X_val_kf_np, y_val_kf_np)],  
-            verbose=False  
-        )  
+def log_message(message: str):
+    """带时间戳的日志输出"""
+    ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    print(f"[{ts}] {message}")
+    sys.stdout.flush()
 
-        y_val_pred_proba = model.predict_proba(X_val_kf_np)[:, 1]  
+def parse_biofeat(biofeat_str):
+    """将 BioFeat 的 JSON 字符串解析为一维 numpy 数组"""
+    try:
+        arr = np.array(json.loads(biofeat_str))
+        return arr.flatten()
+    except Exception as e:
+        log_message(f"BioFeat 解析失败: {str(e)}; 样例片段: {str(biofeat_str)[:120]} ...")
+        return None
 
-        try:  
-            roc_auc = roc_auc_score(y_val_kf_np, y_val_pred_proba)  
-        except ValueError:  
-            roc_auc = 0  
+def evaluate_model(y_true, y_pred, y_pred_proba):
+    """稳健计算各类评估指标（异常时返回 NaN）"""
+    metrics = {}
+    try:
+        metrics['ROC AUC'] = roc_auc_score(y_true, y_pred_proba)
+    except Exception:
+        metrics['ROC AUC'] = np.nan
+    try:
+        metrics['PR AUC'] = average_precision_score(y_true, y_pred_proba)
+    except Exception:
+        metrics['PR AUC'] = np.nan
+    try:
+        metrics['Accuracy'] = accuracy_score(y_true, y_pred)
+    except Exception:
+        metrics['Accuracy'] = np.nan
+    try:
+        metrics['F1'] = f1_score(y_true, y_pred)
+    except Exception:
+        metrics['F1'] = np.nan
+    try:
+        metrics['MCC'] = matthews_corrcoef(y_true, y_pred)
+    except Exception:
+        metrics['MCC'] = np.nan
+    try:
+        metrics['Balanced Accuracy'] = balanced_accuracy_score(y_true, y_pred)
+    except Exception:
+        metrics['Balanced Accuracy'] = np.nan
+    try:
+        metrics['Sensitivity'] = recall_score(y_true, y_pred, pos_label=1)
+    except Exception:
+        metrics['Sensitivity'] = np.nan
+    try:
+        metrics['Specificity'] = recall_score(y_true, y_pred, pos_label=0)
+    except Exception:
+        metrics['Specificity'] = np.nan
+    return metrics
 
-        prc = average_precision_score(y_val_kf_np, y_val_pred_proba)  
-        score = 0.4 * prc + 0.6 * roc_auc  
-        scores.append(score)  
+# =====
+# 主流程
+# =====
 
-    return np.mean(scores) if scores else -1  
+def main():
+    try:
+        log_message("启动：XGBoost（无特征选择）+ 分层10折交叉验证（BioFeat）")
 
-# 读取特征文件  
-features_df = pd.read_csv(features_path)  
-print("特征文件列名:", features_df.columns)  
+        # 读取 CSV
+        log_message("读取输入 CSV ...")
+        df_labels = pd.read_csv(FEATURES_PATH)  # 含标签与 Smiles
+        df_feats  = pd.read_csv(DATA_PATH)      # 含 Smiles 与 BioFeat
 
-# 读取数据集  
-data = pd.read_csv(data_path)  
-print("数据集列名:", data.columns)  
+        # 依据 'Smiles' 合并
+        log_message("按 'Smiles' 进行合并 ...")
+        df = pd.merge(df_labels, df_feats, on='Smiles', how='inner')
+        log_message(f"合并后形状: {df.shape}")
 
-# 合并数据  
-data = pd.merge(data, features_df, on='Smiles', how='inner')  
+        # 解析 BioFeat -> Fingerprints（数值特征向量）
+        log_message("解析 BioFeat 到数值数组 ...")
+        if 'BioFeat' not in df.columns:
+            raise KeyError("合并结果中不包含 'BioFeat' 列，请确认 DATA_PATH 文件中含有该列。")
+        df['Fingerprints'] = df['BioFeat'].apply(parse_biofeat)
+        df = df.dropna(subset=['Fingerprints'])
 
-# 解析特征，并去除无效行  
-data['Fingerprints'] = data['BioFeat'].apply(parse_biofeat)  
-data = data.dropna(subset=['Fingerprints'])  
+        # 组装特征矩阵 X
+        X_all = np.vstack(df['Fingerprints'].values)
 
-# 将每个 FingerprintsList 转换为二维数组  
-data['Fingerprints'] = data['Fingerprints'].apply(lambda x: x.flatten() if x is not None else None)  
+        # 识别任务列（标签列）：排除特征及辅助列
+        exclude_cols = {'Smiles', 'BioFeat', 'Fingerprints'}
+        task_cols = [c for c in df.columns if c not in exclude_cols]
 
-# 找出 ADR 终点列（排除 Smiles 和 Fingerprints）  
-adr_columns = [col for col in data.columns if col not in ['Smiles', 'BioFeat', 'Fingerprints']]  
+        if len(task_cols) == 0:
+            raise ValueError("未找到标签列（任务列）。请确认 FEATURES_PATH 文件中包含 ADR 标签列。")
 
-# 将 Fingerprints 列转换为二维数组  
-X = np.vstack(data['Fingerprints'].values)  # 从 DataFrame 提取特征并转为二维数组  
-y = cp.array(data[adr_columns].values)  
+        # 为数据集创建输出目录
+        dataset_name = os.path.splitext(os.path.basename(DATA_PATH))[0]
+        dataset_dir = os.path.join(OUTPUT_ROOT, dataset_name)
+        os.makedirs(dataset_dir, exist_ok=True)
 
-# 确保数据形状符合要求  
-print("特征形状:", X.shape)  
-print("标签形状:", y.shape)  
+        # 全局汇总日志
+        log_path = os.path.join(OUTPUT_ROOT, f'cv_summary_{dataset_name}.txt')
+        mode = 'a' if os.path.exists(log_path) and START_TASK_ID > 1 else 'w'
+        with open(log_path, mode) as logf:
+            if mode == 'a':
+                logf.write("\n" + "=" * 80 + "\n")
+                logf.write(f"恢复执行，从任务 {START_TASK_ID} 开始\n")
+                logf.write("=" * 80 + "\n\n")
 
-# 设置测试集比例  
-TEST_SIZE = 0.1  
+            # 遍历每个任务（ADR 端点）
+            for task_idx, task_name in enumerate(task_cols, start=1):
+                if task_idx < START_TASK_ID:
+                    continue
 
-# 数据集名称  
-dataset_name = os.path.splitext(os.path.basename(data_path))[0]  
-dataset_dir = os.path.join('xg_biofeat_ablation', dataset_name)  
-os.makedirs(dataset_dir, exist_ok=True)  
+                log_message(f"处理任务 {task_idx}/{len(task_cols)}: {task_name}")
+                task_dir = os.path.join(dataset_dir, f'task_{task_idx:04d}_{task_name}')
+                os.makedirs(task_dir, exist_ok=True)
 
-output_file_name = os.path.join('xg_biofeat_ablation', f'xb_biofeat_ablation{dataset_name}.txt')  
+                # 取出该任务的标签，并过滤 NaN
+                y_all = df[task_name].values
+                mask = ~np.isnan(y_all)
+                X = X_all[mask]
+                y = y_all[mask]
 
-with open(output_file_name, 'w') as f:  
-    for task_id in range(y.shape[1]):  
-        task_dir = os.path.join(dataset_dir, f'task_{task_id + 1}')  
-        os.makedirs(task_dir, exist_ok=True)  
+                # 有效性检查（至少包含两个类别）
+                if len(y) == 0 or len(np.unique(y)) < 2:
+                    log_message(f"任务 {task_idx}（{task_name}）无效（样本为空或仅单一类别），跳过。")
+                    with open(os.path.join(dataset_dir, 'last_completed_task.txt'), 'w') as ck:
+                        ck.write(str(task_idx))
+                    continue
 
-        current_y = y[:, task_id]  
-        print(  
-            f"数据集 {dataset_name} 的任务 {task_id + 1} 的标签分布：{np.unique(cp.asnumpy(current_y), return_counts=True)}")  
+                # 可选：外部留出集（先划分出一部分样本，剩余做 CV）
+                if USE_EXTERNAL_HOLDOUT:
+                    X_train_dev, X_holdout, y_train_dev, y_holdout = train_test_split(
+                        X, y,
+                        test_size=EXTERNAL_TEST_SIZE,
+                        stratify=y,
+                        random_state=RANDOM_STATE
+                    )
+                else:
+                    X_train_dev, y_train_dev = X, y
+                    X_holdout, y_holdout = None, None
 
-        mask = ~cp.isnan(current_y)  
+                # 分层 10 折交叉验证
+                kf = StratifiedKFold(n_splits=N_SPLITS, shuffle=SHUFFLE, random_state=RANDOM_STATE)
+                fold_metrics_list = []
+                fold_pred_records = []
 
-        # 将 mask 转换为 NumPy 数组  
-        mask_np = cp.asnumpy(mask)  
+                for fold_id, (tr_idx, te_idx) in enumerate(kf.split(X_train_dev, y_train_dev), start=1):
+                    X_tr = X_train_dev[tr_idx]
+                    y_tr = y_train_dev[tr_idx]
+                    X_te = X_train_dev[te_idx]
+                    y_te = y_train_dev[te_idx]
 
-        # 使用 NumPy 数组进行索引  
-        X_task = X[mask_np]  # 这里直接用 NumPy 的数组  
-        y_task = current_y[mask]  
+                    # 不做特征选择，直接训练 XGBoost
+                    params = XGB_PARAMS.copy()
+                    if USE_GPU:
+                        params['tree_method'] = 'gpu_hist'
+                    model = xgb.XGBClassifier(**params)
 
-        if len(y_task) == 0 or len(cp.unique(y_task)) < 2:  
-            print(f"数据集 {dataset_name} 的任务 {task_id + 1} 数据无效，跳过")  
-            continue  
+                    # 使用早停避免过拟合（验证折做监控）
+                    model.fit(
+                        X_tr, y_tr,
+                        eval_set=[(X_te, y_te)],
+                        verbose=False,
+                        early_stopping_rounds=20
+                    )
 
-        # Use .get() to convert CuPy to NumPy  
-        X_task_np = X_task  # 这里 X_task 已经是 NumPy 数组  
-        y_task_np = y_task.get()  # 创建 NumPy 数组  
+                    # 验证折预测
+                    y_te_proba = model.predict_proba(X_te)[:, 1]
+                    y_te_pred = (y_te_proba > 0.5).astype(int)
 
-        # 划分训练集和测试集  
-        X_train_dev, X_test, y_train_dev, y_test = train_test_split(  
-            X_task_np, y_task_np,  
-            test_size=TEST_SIZE,  
-            stratify=y_task_np,  
-            random_state=42  
-        )  
+                    # 计算评估指标
+                    m = evaluate_model(y_te, y_te_pred, y_te_proba)
+                    fold_metrics_list.append({'fold': fold_id, **m})
 
-        # 保存测试集数据  
-        test_data_path = os.path.join(task_dir, 'test_data.npz')  
-        np.savez(test_data_path, X_test=X_test, y_test=y_test)  
+                    # 记录每折预测
+                    fold_pred_records.append(pd.DataFrame({
+                        'fold': fold_id,
+                        'y_true': y_te,
+                        'y_pred': y_te_pred,
+                        'y_proba': y_te_proba
+                    }))
 
-        # 保持张量属性  
-        X_train_dev = cp.array(X_train_dev)  
-        X_test = cp.array(X_test)  
-        y_train_dev = cp.array(y_train_dev)  
-        y_test = cp.array(y_test)  
+                    log_message(f"任务 {task_idx} | 折 {fold_id} 指标: {m}")
 
-        study = optuna.create_study(direction='maximize')  
-        study.optimize(lambda trial: objective(trial, X_train_dev, y_train_dev), n_trials=200)  
+                # 保存每折指标
+                cv_df = pd.DataFrame(fold_metrics_list)
+                cv_df.to_csv(os.path.join(task_dir, 'cv_fold_metrics.csv'), index=False)
 
-        best_params = study.best_params  
-        best_value = study.best_value  
+                # 保存每折预测
+                preds_df = pd.concat(fold_pred_records, ignore_index=True)
+                preds_df.to_csv(os.path.join(task_dir, 'cv_fold_predictions.csv'), index=False)
 
-        best_params.update({  
-            'tree_method': 'hist',  
-            'device': 'cuda',  
-            'objective': 'binary:logistic',  
-            'predictor': 'gpu_predictor',  
-            'eval_metric': 'auc',  
-            'verbosity': 0  
-        })  
+                # 写入任务级汇总（均值 ± 标准差）
+                with open(os.path.join(task_dir, 'cv_summary.txt'), 'w') as tf:
+                    tf.write(f"Task: {task_name}\n")
+                    tf.write("Stratified 10-Fold CV（均值 ± 标准差）:\n")
+                    for metric in ['ROC AUC', 'PR AUC', 'Accuracy', 'F1', 'MCC',
+                                   'Balanced Accuracy', 'Sensitivity', 'Specificity']:
+                        mean_val = cv_df[metric].mean()
+                        std_val = cv_df[metric].std()
+                        tf.write(f"- {metric}: {mean_val:.6f} ± {std_val:.6f}\n")
 
-        final_model = xgb.XGBClassifier(**best_params)  
+                # 如启用外部留出集：在全部 train_dev 上重训并评估
+                if USE_EXTERNAL_HOLDOUT:
+                    params = XGB_PARAMS.copy()
+                    if USE_GPU:
+                        params['tree_method'] = 'gpu_hist'
+                    final_model = xgb.XGBClassifier(**params)
+                    final_model.fit(X_train_dev, y_train_dev)
 
-        X_train_dev_np = cp.asnumpy(X_train_dev)  
-        y_train_dev_np = cp.asnumpy(y_train_dev)  
-        X_test_np = cp.asnumpy(X_test)  
-        y_test_np = cp.asnumpy(y_test)  
+                    y_hold_proba = final_model.predict_proba(X_holdout)[:, 1]
+                    y_hold_pred = (y_hold_proba > 0.5).astype(int)
+                    hold_metrics = evaluate_model(y_holdout, y_hold_pred, y_hold_proba)
 
-        final_model.fit(X_train_dev_np, y_train_dev_np)  
+                    # 保存外部留出集结果
+                    pd.DataFrame([hold_metrics]).to_csv(os.path.join(task_dir, 'external_holdout_metrics.csv'), index=False)
+                    pd.DataFrame({
+                        'y_true': y_holdout,
+                        'y_pred': y_hold_pred,
+                        'y_proba': y_hold_proba
+                    }).to_csv(os.path.join(task_dir, 'external_holdout_predictions.csv'), index=False)
 
-        y_test_pred_proba = final_model.predict_proba(X_test_np)[:, 1]  
-        y_test_pred = y_test_pred_proba > 0.5  
+                # 写入全局汇总日志
+                with open(log_path, 'a' if mode == 'a' else 'w') as lg:
+                    if mode != 'a':
+                        lg.write("")
+                    lg.write(f"\nTask {task_idx} ({task_name}) CV metrics (mean ± std):\n")
+                    for metric in ['ROC AUC', 'PR AUC', 'Accuracy', 'F1', 'MCC',
+                                   'Balanced Accuracy', 'Sensitivity', 'Specificity']:
+                        mean_val = cv_df[metric].mean()
+                        std_val = cv_df[metric].std()
+                        lg.write(f"{metric}: {mean_val:.6f} ± {std_val:.6f}\n")
+                    lg.write("-" * 60 + "\n")
 
-        test_roc_auc = roc_auc_score(y_test_np, y_test_pred_proba)  
-        test_prc = average_precision_score(y_test_np, y_test_pred_proba)  
-        test_accuracy = accuracy_score(y_test_np, y_test_pred)  
-        test_f1 = f1_score(y_test_np, y_test_pred)  
-        test_mcc = matthews_corrcoef(y_test_np, y_test_pred)  
+                # 记录断点
+                with open(os.path.join(dataset_dir, 'last_completed_task.txt'), 'w') as ck:
+                    ck.write(str(task_idx))
 
-        test_metrics = {  
-            'ROC AUC': test_roc_auc,  
-            'Precision-Recall AUC': test_prc,  
-            'Accuracy': test_accuracy,  
-            'F1 Score': test_f1,  
-            'MCC': test_mcc  
-        }  
+                log_message(f"完成任务 {task_idx}: {task_name}")
 
-        # 保存测试集性能指标  
-        test_metrics_path = os.path.join(task_dir, 'test_metrics.csv')  
-        pd.DataFrame([test_metrics]).to_csv(test_metrics_path, index=False)  
+        log_message("全部任务处理完成。")
 
-        # 记录测试集性能指标  
-        f.write(f"\n任务 {task_id + 1} 的测试集性能指标：\n")  
-        for metric_name, value in test_metrics.items():  
-            f.write(f"{metric_name}: {value:.4f}\n")  
-        f.write('-' * 50 + '\n')  
+    except Exception as e:
+        log_message(f"程序异常终止: {str(e)}")
+        import traceback
+        log_message(traceback.format_exc())
+        sys.exit(1)
 
-        # 保存最终模型  
-        model_path = os.path.join(task_dir, 'final_model.joblib')  
-        joblib.dump(final_model, model_path)  
-
-        # 绘制测试集的 ROC 曲线  
-        plt.figure(figsize=(8, 6))  
-        fpr, tpr, _ = roc_curve(y_test_np, y_test_pred_proba)  
-
-        # 绘制 ROC 曲线  
-        plt.figure(figsize=(8, 6))  
-        plt.plot(fpr, tpr, label=f'Test ROC (AUC = {test_roc_auc:.2f})')  
-        plt.plot([0, 1], [0, 1], linestyle='--', color='r')  # 参考线  
-        plt.xlabel('False Positive Rate')  
-        plt.ylabel('True Positive Rate')  
-        plt.title(f'Test ROC Curve for {dataset_name} Task {task_id + 1}')  
-        plt.legend()  
-        plt.grid(True)  
-        plt.tight_layout()  
-
-        # 保存图像  
-        test_roc_plot_path = os.path.join(task_dir, 'test_roc_curve.png')  
-        plt.savefig(test_roc_plot_path, dpi=300, bbox_inches='tight')  
-        plt.close()  
-
-        print(f"任务 {task_id + 1} 完成，所有文件已保存到: {task_dir}")   
-
-print("所有任务完成！")
+if __name__ == "__main__":
+    main()
