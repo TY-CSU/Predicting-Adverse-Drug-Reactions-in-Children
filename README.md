@@ -10,7 +10,7 @@ This project aims to study predictive models for adverse drug reactions in pedia
 This dataset accompanies the manuscript:
 
 **"Machine Learning Prediction of Pediatric Adverse Drug Reactions Using Consensus-Derived Scarce Data"**  
-*Communications Chemistry* (COMMSCHEM-25-0789B) - Accepted in principle
+*Communications Chemistry* - Accepted in principle
 
 ## Dataset Description
 
