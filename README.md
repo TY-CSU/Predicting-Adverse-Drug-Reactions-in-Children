@@ -24,6 +24,12 @@ This dataset contains molecular structures (SMILES format) and their associated 
 First column: SMILES notation of molecular structures
 Remaining columns: Binary labels for individual ADR tasks (1 = positive, 0 = negative, empty = unlabeled)
 
+## Biological Fingerprints
+
+For the Biofeat used in our study, we utilized the **Chemical Checker** approach. Due to the large model size, we provide only the code for converting SMILES to biological fingerprints in this repository. For detailed implementation and pre-trained models, please refer to:
+
+**https://github.com/ersilia-os/eos4u6p**
+
 ## Limitations
 
 Users should be aware of the following limitations when utilizing this dataset:
